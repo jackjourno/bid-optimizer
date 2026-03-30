@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="it">
 <head>
@@ -5350,7 +5351,9 @@ function runVerify() {
     if (r['Entity'] === 'Campaign') vStratMap[cid] = String(r['Bidding Strategy'] || '');
     if (r['Entity'] === 'Bidding Adjustment') {
       if (!vPlaceMap[cid]) vPlaceMap[cid] = {};
-      const pl = String(r['Placement'] || '').replace('Placement ','').trim();
+      const _plRaw2 = String(r['Placement'] || '').replace('Placement ','').trim();
+      const _plNorm2 = {'Top Of Search':'Top','Top of Search':'Top','Rest Of Search':'Rest of Search','Rest of search':'Rest of Search','Product pages':'Product Page','Detail Page':'Product Page'};
+      const pl = _plNorm2[_plRaw2] || _plRaw2;
       vPlaceMap[cid][pl] = sfloat(r['Percentage']);
     }
   }
@@ -7002,8 +7005,11 @@ function _runOptimizer() {
       stratMap[cid] = String(r['Bidding Strategy'] || '');
     }
     if (r['Entity'] === 'Bidding Adjustment') {
-      const pl = String(r['Placement'] || '').replace('Placement ','').trim();
-      if (!pl || pl === 'Amazon Business' || pl === 'nan') continue;
+      const _plRaw = String(r['Placement'] || '').replace('Placement ','').trim();
+      // Normalize capitalization variants
+      const _plNorm = {'Top Of Search':'Top','Top of Search':'Top','Rest Of Search':'Rest of Search','Rest of search':'Rest of Search','Product pages':'Product Page','Detail Page':'Product Page'};
+      const pl = _plNorm[_plRaw] || _plRaw;
+      if (!pl || pl === 'Amazon Business' || pl === 'nan' || pl === 'Amazon business') continue;
       const spend  = sfloat(r['Spend']);
       const sales  = sfloat(r['Sales']);
       const clicks = sfloat(r['Clicks']);
@@ -7031,6 +7037,7 @@ function _runOptimizer() {
   // Also build a name-keyed index for Auto campaigns (which have campName but not always campId)
   window._spPlacePerfByName = {};
   window._spStratByName = {};
+  window._spCampNameToId = {}; // campName (lowercase) → campId — for placement lookup
   for (const r of spRows) {
     const ent = r['Entity'];
     const cid = String(Math.round(sfloat(r['Campaign ID'])));
@@ -7039,11 +7046,13 @@ function _runOptimizer() {
       const cname = String(r['Campaign Name'] || r['Campaign Name (Informational only)'] || '').toLowerCase().trim();
       if (cname && placePerfMap[cid]) window._spPlacePerfByName[cname] = placePerfMap[cid];
       if (cname && stratMap[cid])     window._spStratByName[cname]     = stratMap[cid];
+      if (cname && cid)               window._spCampNameToId[cname]    = cid;
     }
     // Also index from Bidding Adjustment rows (they have the informational name)
     if (ent === 'Bidding Adjustment') {
       const cname = String(r['Campaign Name (Informational only)'] || r['Campaign Name'] || '').toLowerCase().trim();
       if (cname && placePerfMap[cid]) window._spPlacePerfByName[cname] = placePerfMap[cid];
+      if (cname && cid)               window._spCampNameToId[cname]    = cid;
     }
   }
 
@@ -7847,6 +7856,7 @@ function _saveSessionData() {
       _placeMap: window._placeMap || {},
       _spPlacePerfMap: window._spPlacePerfMap || {},
       _spPlacePerfByName: window._spPlacePerfByName || {},
+      _spCampNameToId: window._spCampNameToId || {},
       _sbPlacePerfMap: window._sbPlacePerfMap || {},
     };
     localStorage.setItem(SESSION_DATA_KEY, JSON.stringify(data));
@@ -7879,6 +7889,7 @@ function _restoreSessionData() {
     if (data._spPlacePerfMap)        window._spPlacePerfMap = data._spPlacePerfMap;
     if (data._sbPlacePerfMap)        window._sbPlacePerfMap = data._sbPlacePerfMap;
     if (data._spPlacePerfByName)     window._spPlacePerfByName = data._spPlacePerfByName;
+    if (data._spCampNameToId)        window._spCampNameToId    = data._spCampNameToId;
     return { hasPeriod, hasH10 };
   } catch(e) { console.warn('Session restore error:', e); return false; }
 }
@@ -10529,9 +10540,19 @@ function _renderStrAggProduct(product) {
         // Fallback: find campId from RESULT_DATA or SB_RESULT_DATA when not in static map
         const _campIdFallback = (() => {
           if (bdCE && bdCE.campId) return null;
+          const campLower = (b.camp||'').toLowerCase();
+          // Fast lookup via pre-built name→id map
+          if (b.source !== 'SB' && window._spCampNameToId && window._spCampNameToId[campLower]) return window._spCampNameToId[campLower];
           const src = b.source === 'SB' ? (SB_RESULT_DATA||[]) : (RESULT_DATA||[]);
-          const found = src.find(r => (r.campaign||'').toLowerCase() === (b.camp||'').toLowerCase());
-          return found ? String(found.campId||'') : null;
+          const found = src.find(r => (r.campaign||'').toLowerCase() === campLower);
+          if (found && found.campId) return String(found.campId);
+          // For SP Auto: try PT_DATA by camp name
+          if (b.source !== 'SB' && PT_DATA) {
+            for (const [cid, pts] of Object.entries(PT_DATA)) {
+              if (pts.some(p => (p.camp||'').toLowerCase() === campLower)) return cid;
+            }
+          }
+          return null;
         })();
         // For SB: also try _sbPlacePerfMap keys directly by matching campaign name
         const _sbCampIdDirect = (() => {
@@ -10718,6 +10739,20 @@ function _renderStrAggProduct(product) {
           if (PT_DATA) {
             for (const [cid, pts] of Object.entries(PT_DATA)) {
               if (pts.some(p => (p.camp||'').toLowerCase() === campLower)) return cid;
+            }
+          }
+          // Try _placeMap keys directly — reverse lookup via _spPlacePerfByName
+          if (window._spPlacePerfByName && window._spPlacePerfByName[campLower]) {
+            // Find campId in placePerfMap that matches this entry
+            const perfData = window._spPlacePerfByName[campLower];
+            const found2 = window._spPlacePerfMap && Object.entries(window._spPlacePerfMap).find(([cid, data]) => data === perfData);
+            if (found2) return found2[0];
+          }
+          // Try _placeMap keys with _spPlacePerfMap reverse match
+          if (window._spPlacePerfMap) {
+            for (const cid of Object.keys(window._spPlacePerfMap)) {
+              const perfByName = window._spPlacePerfByName || {};
+              if (perfByName[campLower] && window._spPlacePerfMap[cid] === perfByName[campLower]) return cid;
             }
           }
           // Try _sbPlacePerfMap keys for SB auto/PT
